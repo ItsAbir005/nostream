@@ -27,10 +27,16 @@ pub struct WotGraphService {
     inner: Arc<Inner>,
 }
 
+#[derive(Default)]
+struct FollowsEntry {
+    generation: u64,
+    follows: Vec<String>,
+}
+
 struct Inner {
     settings: Arc<Settings>,
     events: Arc<dyn EventRepository>,
-    follows: Mutex<HashMap<String, Vec<String>>>,
+    follows: Mutex<HashMap<String, FollowsEntry>>,
     distances: Mutex<HashMap<String, u32>>,
     ready: AtomicBool,
     building: AtomicBool,
@@ -251,17 +257,22 @@ impl WotGraphService {
     /// One member counts once: a contact list that repeats a `p` tag must not satisfy
     /// `minimum_followers` on its own.
     async fn get_follows(&self, pubkey: &str) -> Result<Vec<String>, ServicesError> {
-        {
+        let read_gen = {
             let follows = self
                 .inner
                 .follows
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            if let Some(cached) = follows.get(pubkey).filter(|cached| !cached.is_empty()) {
-                return Ok(cached.clone());
+            if let Some(cached) = follows
+                .get(pubkey)
+                .filter(|cached| !cached.follows.is_empty())
+            {
+                return Ok(cached.follows.clone());
             }
-        }
+
+            follows.get(pubkey).map_or(0, |cached| cached.generation)
+        };
 
         let filter = Filter {
             kinds: Some(vec![Kind::CONTACT_LIST]),
@@ -276,6 +287,14 @@ impl WotGraphService {
         )
         .await?;
         let Some(record) = rows.into_iter().next() else {
+            let cached = self
+                .inner
+                .follows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cached.get(pubkey).filter(|e| e.generation != read_gen) {
+                return Ok(entry.follows.clone());
+            }
             return Ok(Vec::new());
         };
 
@@ -291,15 +310,21 @@ impl WotGraphService {
                 .filter_map(|tag| tag.get(1).map(String::as_str)),
         );
 
-        if !follows.is_empty() {
-            self.inner
-                .follows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(pubkey.to_owned(), follows.clone());
-        }
+        let mut cached = self
+            .inner
+            .follows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        Ok(follows)
+        let entry = cached.entry(pubkey.to_owned()).or_default();
+        if entry.generation == read_gen {
+            if !follows.is_empty() {
+                entry.follows = follows.clone();
+            }
+            Ok(follows)
+        } else {
+            Ok(entry.follows.clone())
+        }
     }
 }
 
@@ -321,13 +346,12 @@ impl WotGraph for WotGraphService {
                     .follows
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                cached.remove(&key);
 
                 let follows = deduplicated(follows.iter().map(String::as_str));
 
-                if !follows.is_empty() {
-                    cached.insert(key.clone(), follows);
-                }
+                let entry = cached.entry(key.clone()).or_default();
+                entry.generation += 1;
+                entry.follows = follows;
             }
 
             // A pubkey outside the graph cannot change anyone's distance from the seed, so
