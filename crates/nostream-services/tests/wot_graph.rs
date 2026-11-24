@@ -503,6 +503,62 @@ async fn a_cancelled_caller_leaves_the_graph_buildable() {
     assert_eq!(distance, Some(1));
 }
 
+#[tokio::test]
+async fn update_follow_list_during_storage_read_is_not_overwritten_by_stale_data() {
+    let b_probe = contact_list(&[3; 32], &[]);
+    let c_probe = contact_list(&[4; 32], &[]);
+    let (b, c) = (b_probe.pubkey, c_probe.pubkey);
+    let a_probe = contact_list(&[2; 32], &[]);
+    let a = a_probe.pubkey;
+
+    // In storage, A follows B.
+    let a_event = contact_list(&[2; 32], &[&b]);
+    let seed_probe = contact_list(&[1; 32], &[]);
+    let seed = seed_probe.pubkey;
+
+    let repository = InMemoryEventRepository::with_events([a_event]);
+    let settings = wot_settings(true, &seed.to_string(), 2, 1);
+    let service = WotGraphService::new(Arc::new(settings), events(&repository));
+
+    // Gate repository reads before starting the build.
+    let gate = repository.gate_reads();
+
+    // Cache the seed's follow list so the build immediately advances to A's row without
+    // reading the seed from storage. This triggers build 1.
+    service
+        .update_follow_list(&seed, &follows(&[&a]))
+        .await
+        .unwrap();
+
+    // Give a brief moment for the build task to reach A's find_by_filters and block on gate.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // While A's storage read is in flight, A commits a newer follow list containing C.
+    // This updates the cache and queues rebuild 2.
+    service
+        .update_follow_list(&a, &follows(&[&c]))
+        .await
+        .unwrap();
+
+    // Release the gate so the older storage read of A (following B) completes.
+    gate.add_permits(16);
+
+    // Wait for the in-flight build and the queued rebuild to settle.
+    wait_for_rebuilds(&service, 1).await;
+
+    // The newer entry (C) must survive in the cache rather than being overwritten by stale B.
+    assert_eq!(
+        service.get_distance(&c).await.unwrap(),
+        Some(2),
+        "C should be reached through A's updated follows"
+    );
+    assert_eq!(
+        service.get_distance(&b).await.unwrap(),
+        None,
+        "stale follow B should not be present in the graph"
+    );
+}
+
 /// `contact_list` with the instant a newest-first read discriminates on.
 fn contact_list_at(secret: &[u8; 32], follows: &[&Pubkey], created_at: i64) -> Event {
     let mut event = contact_list(secret, follows);
